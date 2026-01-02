@@ -820,3 +820,40 @@ class ChooseSimpleDummyVecEnv(ShareVecEnv):
                 env.render(mode=mode)
         else:
             raise NotImplementedError
+
+# --- convenience factories for cloud_scaling (shared observation API) ---
+def make_scaling_train_env(all_args):
+    from onpolicy.envs.cloud_scaling.scaling_env import CloudScalingEnv
+    def get_env_fn(rank):
+        def init_env():
+            env = CloudScalingEnv(all_args,
+                                  max_agents=getattr(all_args, "max_agents", 8),
+                                  init_agents=getattr(all_args, "init_agents", 3),
+                                  obs_dim=getattr(all_args, "obs_dim", 8),
+                                  episode_length=getattr(all_args, "episode_length", 200))
+            env.seed(getattr(all_args, "seed", 1) + rank * 1000)
+            return env
+        return init_env
+    if all_args.n_rollout_threads == 1:
+        return ShareDummyVecEnv([get_env_fn(0)])
+    else:
+        return ShareSubprocVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
+
+
+def make_scaling_eval_env(all_args):
+    from onpolicy.envs.cloud_scaling.scaling_env import CloudScalingEnv
+    def get_env_fn(rank):
+        def init_env():
+            env = CloudScalingEnv(all_args,
+                                  max_agents=getattr(all_args, "max_agents", 8),
+                                  init_agents=getattr(all_args, "init_agents", 3),
+                                  obs_dim=getattr(all_args, "obs_dim", 8),
+                                  episode_length=getattr(all_args, "episode_length", 200))
+            env.seed(getattr(all_args, "seed", 1) * 50000 + rank * 10000)
+            return env
+        return init_env
+    if all_args.n_eval_rollout_threads == 1:
+        return ShareDummyVecEnv([get_env_fn(0)])
+    else:
+        return ShareSubprocVecEnv([get_env_fn(i) for i in range(all_args.n_eval_rollout_threads)])
+# --- end factories ---

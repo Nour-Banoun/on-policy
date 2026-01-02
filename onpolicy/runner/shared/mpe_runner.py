@@ -28,7 +28,7 @@ class MPERunner(Runner):
                 values, actions, action_log_probs, rnn_states, rnn_states_critic, actions_env = self.collect(step)
                     
                 # Obser reward and next obs
-                obs, rewards, dones, infos = self.envs.step(actions_env)
+                obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(actions_env)
 
                 data = obs, rewards, dones, infos, values, actions, action_log_probs, rnn_states, rnn_states_critic
 
@@ -58,9 +58,9 @@ class MPERunner(Runner):
                                 total_num_steps,
                                 self.num_env_steps,
                                 int(total_num_steps / (end - start))))
-
+                env_infos = {}
                 if self.env_name == "MPE":
-                    env_infos = {}
+                    
                     for agent_id in range(self.num_agents):
                         idv_rews = []
                         for info in infos:
@@ -80,7 +80,7 @@ class MPERunner(Runner):
 
     def warmup(self):
         # reset env
-        obs = self.envs.reset()
+        obs, share_obs, available_actions = self.envs.reset()
 
         # replay buffer
         if self.use_centralized_V:

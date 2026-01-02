@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Example: short dry-run training using CloudScalingEnv (for quick smoke test)
+python3 onpolicy/scripts/train/train_scaling_multi.py --env_name cloud_scaling  --max_agents 1000 --init_agents 1 --obs_dim 8  --episode_length 50 --algorithm_name rmappo --num_env_steps 2000000  --n_rollout_threads 1 --n_training_threads 1  --ppo_epoch 4  --num_mini_batch 4  --use_recurrent_policy  --seed 1   --experiment_name smoke_test

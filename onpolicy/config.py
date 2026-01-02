@@ -304,4 +304,9 @@ def get_config():
     parser.add_argument("--train_maps", type=str, nargs='+', default=None)
     parser.add_argument("--eval_maps", type=str, nargs='+', default=None)
     
+    parser.add_argument("--Number_of_agents", type=int, default=1, help="Initial number of agents (also persisted in cache).")
+    parser.add_argument("--cost_per_agent_per_hour", type=float, default=0.01, help="Cost per agent per hour (dollars).")
+    parser.add_argument("--cost_threshold_per_month", type=float, default=10.0, help="Monthly cost threshold (dollars).")
+    parser.add_argument("--step_seconds", type=int, default=60, help="Duration in seconds represented by one env step (used for cost scaling).")
+    
     return parser
