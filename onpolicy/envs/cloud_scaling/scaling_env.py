@@ -65,6 +65,26 @@ class CloudScalingEnv(object):
         # set derived values: use cached Number_of_agents as initial active agents
         self.init_agents = max(1, int(self.cache.get("Number_of_agents", self.init_agents)))
 
+        # convenience aliases / runtime defaults exposed on the env
+        # legacy cost fields (kept for backward compatibility)
+        self.cost_per_agent_per_hour = float(self.cache.get("cost_per_agent_per_hour", 0.01))
+        self.cost_limitation_month = float(self.cache.get("cost_threshold_per_month", 10.0))
+        # new experimental parameters
+        # per-instance cost options (user requested: 5:5:50)
+        self.instance_costs = np.arange(5, 51, 5).astype(np.float32)
+        # per-month cost limitation options (50:50:1000)
+        self.cost_limitations = np.arange(50, 1001, 50).astype(np.float32)
+        # selected indices (defaults to first value)
+        self.instance_cost_idx = 0
+        self.cost_limitation_idx = 0
+        # current scalar values (derived)
+        self.instance_cost = float(self.instance_costs[self.instance_cost_idx])
+        self.cost_limitation = float(self.cost_limitations[self.cost_limitation_idx])
+        # alias for clarity: maximum instances per slot (static default requested = 1000)
+        self.max_instances = int(getattr(all_args, "max_instances", 1000))
+        # tunable weight for utilization penalty in reward (can be passed via CLI/all_args)
+        self.util_penalty_weight = float(getattr(all_args, "util_penalty_weight", 100.0))
+
         # action / observation spaces (one entry per slot up to max_agents)
         # action: 3 discrete options per agent
         self.action_space = [spaces.Discrete(3) for _ in range(self.max_agents)]
@@ -103,7 +123,8 @@ class CloudScalingEnv(object):
         self.active_mask[:] = False
         for i in range(min(self.init_agents, self.max_agents)):
             self.active_mask[i] = True
-            self.instance_count[i] = 1  # each active slot represents one VM/instance
+            # initial running instances per active slot (user requested initial value = 2)
+            self.instance_count[i] = 2  # number of instances running in this slot
             self.last_action[i] = 0
         self.current_step = 0
         self.sim.reset()
@@ -132,7 +153,8 @@ class CloudScalingEnv(object):
         throughput = float(metrics.get("throughput", 0.0))
         latency = float(metrics.get("latency", 0.0))
 
-        instance_norm = float(self.instance_count[slot_idx]) / max(1.0, np.max(self.instance_count))
+        # report raw running instance count (0 or 1) rather than a normalized value
+        instance_running = float(self.instance_count[slot_idx])
         last_action_val = float(self.last_action[slot_idx])  # -1,0,1
 
         time_since_scale_norm = float(self.sim.time_since_last_scale(slot_idx)) / max(1.0, self.episode_length)
@@ -144,7 +166,7 @@ class CloudScalingEnv(object):
             net,
             throughput,
             np.tanh(latency / 1000.0),  # soft normalize latency
-            instance_norm,
+            instance_running,
             (last_action_val + 1.0) / 2.0,  # map -1/0/1 to 0..1
             time_since_scale_norm
         ], dtype=np.float32)
@@ -194,86 +216,134 @@ class CloudScalingEnv(object):
         """
         self.current_step += 1
 
-        # sanitize actions
+        # sanitize actions (these are the new actions that will take effect next step)
         a = np.array(actions).reshape(-1)
         if a.shape[0] < self.max_agents:
-            # pad with hold (1)
-            pad = np.ones(self.max_agents - a.shape[0], dtype=int)
+            pad = np.ones(self.max_agents - a.shape[0], dtype=int)  # default hold
             a = np.concatenate([a, pad])
         elif a.shape[0] > self.max_agents:
             a = a[:self.max_agents]
 
-        # translate discrete actions: 0 -> -1 (scale_in), 1 -> 0 (hold), 2 -> +1 (scale_out)
-        delta = np.zeros(self.max_agents, dtype=int)
-        delta[a == 0] = -1
-        delta[a == 1] = 0
-        delta[a == 2] = +1
+        # map incoming actions to stored last_action values for next step
+        incoming_delta = np.zeros(self.max_agents, dtype=int)
+        incoming_delta[a == 0] = -1
+        incoming_delta[a == 1] = 0
+        incoming_delta[a == 2] = 1
 
-        # process removals
-        remove_requests = np.where((delta == -1) & (self.active_mask))[0]
-        for idx in remove_requests:
-            self.active_mask[idx] = False
-            self.instance_count[idx] = 0
-            self.last_action[idx] = -1
-            self.sim.mark_removed(idx)
+        # Apply effects of the previous actions (self.last_action) now.
+        # Reward for the previous action is computed using metrics after these updates.
+        prev_action = self.last_action.copy()
 
-        # process creates: count +1 requests from active agents and instantiate in free slots
-        requested_creates = int(np.sum((delta == 1) & (self.active_mask)))
-        if requested_creates > 0:
-            free_slots = np.where(~self.active_mask)[0]
-            # cap number created per step
-            num_to_create = min(requested_creates, len(free_slots), self.max_create_per_step)
-            to_fill = free_slots[:num_to_create]
-            for s in to_fill:
-                self.active_mask[s] = True
-                self.instance_count[s] = 1
-                self.last_action[s] = 1
-                self.sim.mark_created(s)
-
-        # holds
+        # Update instance counts based on previous action (scale out/in affect instance_running)
         for i in range(self.max_agents):
-            if self.active_mask[i] and delta[i] == 0:
-                self.last_action[i] = 0
+            if not self.active_mask[i]:
+                continue
+            if prev_action[i] == 1:
+                # previous step requested scale out -> increase running instances
+                self.instance_count[i] = min(self.max_instances, int(self.instance_count[i]) + 1)
+            elif prev_action[i] == -1:
+                # previous step requested scale in -> decrease, but not below 1
+                self.instance_count[i] = max(1, int(self.instance_count[i]) - 1)
 
-        # simulator step
+        # update simulator with current instance counts
         self.sim.step(self.active_mask.copy(), self.instance_count.copy())
 
-        # compute rewards per agent
+        # compute rewards for previous actions (using updated metrics)
         rewards = []
         infos = []
         for i in range(self.max_agents):
             if not self.active_mask[i]:
                 rewards.append([0.0])
-                infos.append({"active": False})
+                infos.append({
+                    "active": False,
+                    "current_cost": 0.0,
+                    "cost_limitation": float(self.cost_limitation),
+                    "max_instances": int(self.max_instances)
+                })
                 continue
 
             metrics = self.sim.get_metrics(i)
-            cpu = metrics.get("cpu", 0.0)
-            latency = metrics.get("latency", 0.0)
-            throughput = metrics.get("throughput", 0.0)
+            cpu = float(metrics.get("cpu", 0.0))
+            mem = float(metrics.get("mem", 0.0))
+            net = float(metrics.get("net", 0.0))
+            throughput = float(metrics.get("throughput", 0.0))
+            latency = float(metrics.get("latency", 0.0))
+            cap = float(metrics.get("cap", self.sim.base_capacity))
 
-            # cost per step derived from per-hour cost stored in cache
-            cost_per_hour = float(self.cache.get("cost_per_agent_per_hour", 0.01))
-            cost_per_step = cost_per_hour * (self.step_seconds / 3600.0)
-            cost_per_agent = cost_per_step
+            # determine per-slot instance cost (env-level scalar) and current_cost
+            self.instance_cost = float(self.instance_costs[self.instance_cost_idx])
+            self.cost_limitation = float(self.cost_limitations[self.cost_limitation_idx])
+            current_cost = float(self.instance_count[i]) * float(self.instance_cost)
 
+            # Apply multiplier to metrics based on the PREVIOUS action
+            if prev_action[i] == 1:
+                # scale out: factor = (old_count)/(new_count) = (instance_count-1)/instance_count
+                if self.instance_count[i] > 0:
+                    factor = float(self.instance_count[i] - 1) / float(self.instance_count[i])
+                else:
+                    factor = 1.0
+                cpu *= factor
+                mem *= factor
+                net *= factor
+                throughput *= factor
+                latency *= factor
+                cap *= factor
+            elif prev_action[i] == -1:
+                # scale in: factor = (old_count)/(new_count) = (instance_count+1)/instance_count
+                factor = float(self.instance_count[i] + 1) / float(self.instance_count[i]) if self.instance_count[i] > 0 else 1.0
+                cpu *= factor
+                mem *= factor
+                net *= factor
+                throughput *= factor
+                latency *= factor
+                cap *= factor
+            else:
+                # no-scale: leave metrics as produced (randomized by simulator)
+                pass
+
+            # reward computed for the PREVIOUS action using updated metrics
+            # Base reward now encourages staying under the monthly cost limitation
             sla_threshold_ms = 200.0
             sla_penalty = 100.0
-            scale_penalty = 0.05 * abs(self.last_action[i])
+            scale_penalty = 0.05 * abs(prev_action[i])
 
-            reward = - cost_per_agent * float(self.instance_count[i])
+            # Base reward: positive when current cost is below the cost limitation
+            cost_penalty_weight = 200.0
+            reward = cost_penalty_weight * float(self.cost_limitation - current_cost)/self.cost_limitation
+
+            # Consider cpu, mem, net utilizations (values in 0..1 from simulator)
+            # We penalize higher utilization to encourage sufficient capacity.
+            util_avg = (cpu + mem + net) / 3.0
+            # Tunable weight (can be passed via CLI as --util_penalty_weight)
+            reward -= float(self.util_penalty_weight) * util_avg
+
+            # SLA latency penalty (unchanged): heavy penalty when latency exceeds threshold
             if latency > sla_threshold_ms:
                 reward -= sla_penalty * (latency - sla_threshold_ms) / sla_threshold_ms
-            reward += 0.05 * min(throughput / max(metrics.get("cap", 1.0), 1.0), 1.0)
+
+            # Throughput bonus (small) normalized by capacity
+            reward += 0.05 * min(throughput / max(cap, 1.0), 1.0)
+
+            # Small penalty for scaling actions (encourage stability)
             reward -= scale_penalty
 
             rewards.append([float(reward)])
             infos.append({
                 "active": True,
-                "cpu": cpu,
-                "latency": latency,
-                "throughput": throughput
+                "cpu": float(cpu),
+                "mem": float(mem),
+                "net": float(net),
+                "throughput": float(throughput),
+                "latency": float(latency),
+                "cap": float(cap),
+                "current_cost": float(current_cost),
+                "instance_running": int(self.instance_count[i]),
+                "cost_limitation": float(self.cost_limitation),
+                "max_instances": int(self.max_instances)
             })
+
+        # finally, store incoming actions as last_action for use in next step
+        self.last_action = incoming_delta.copy()
 
         # done flags: end episode when current_step >= episode_length
         done_flag = (self.current_step >= self.episode_length)
@@ -286,6 +356,21 @@ class CloudScalingEnv(object):
         available_actions = self._avail_actions_cache.copy()
 
         return obs, share_obs, rewards, dones, infos, available_actions
+    
+    # def close(self):
+    #     """
+    #     Clean up resources used by the environment.
+    #     VecEnv wrappers call `env.close()` during teardown, so provide
+    #     a safe implementation that tolerates missing simulator close.
+    #     """
+    #     try:
+    #         if hasattr(self, "sim") and hasattr(self.sim, "close"):
+    #             try:
+    #                 self.sim.close()
+    #             except Exception:
+    #                 pass
+    #     except Exception:
+    #         pass
 
     def render(self, mode='human'):
         info = {
@@ -327,9 +412,45 @@ class CloudScalingEnv(object):
         if persist:
             self._save_cache()
 
+    def set_instance_cost_index(self, idx, reset_running=True):
+        """Set the index into `instance_costs`. Optionally reset running instances to initial value."""
+        idx = int(idx) % len(self.instance_costs)
+        self.instance_cost_idx = idx
+        self.instance_cost = float(self.instance_costs[self.instance_cost_idx])
+        if reset_running:
+            # reset running instances for active slots to initial value (2)
+            for i in range(self.max_agents):
+                if self.active_mask[i]:
+                    self.instance_count[i] = 2
+
+    def set_cost_limitation_index(self, idx, reset_running=True):
+        """Set the index into `cost_limitations`. Optionally reset running instances to initial value."""
+        idx = int(idx) % len(self.cost_limitations)
+        self.cost_limitation_idx = idx
+        self.cost_limitation = float(self.cost_limitations[self.cost_limitation_idx])
+        if reset_running:
+            for i in range(self.max_agents):
+                if self.active_mask[i]:
+                    self.instance_count[i] = 2
+
     def get_active_mask(self):
         """
         Return a copy of the boolean active mask (length == max_agents).
         Trainers/runners can call `env.get_active_mask()` or read `env.active_mask`.
         """
         return self.active_mask.copy()
+
+    def close(self):
+        """
+        Clean up resources used by the environment.
+        VecEnv wrappers call `env.close()` during teardown, so provide
+        a safe implementation that tolerates missing simulator close.
+        """
+        try:
+            if hasattr(self, "sim") and hasattr(self.sim, "close"):
+                try:
+                    self.sim.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass

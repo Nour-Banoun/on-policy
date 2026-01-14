@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import sys
 import os
-import wandb
 import socket
 import setproctitle
 import numpy as np
@@ -28,6 +27,13 @@ def main(args):
         all_args.obs_dim = 8
     if not hasattr(all_args, "episode_length"):
         all_args.episode_length = 200
+    # cost and scaling defaults
+    if not hasattr(all_args, "cost_per_agent_per_hour"):
+        all_args.cost_per_agent_per_hour = 0.01
+    if not hasattr(all_args, "cost_threshold_per_month"):
+        all_args.cost_threshold_per_month = 10.0
+    if not hasattr(all_args, "max_create_per_step"):
+        all_args.max_create_per_step = 1
     # ensure runner-expected metadata exists (used for logging)
     if not hasattr(all_args, "scenario_name"):
         all_args.scenario_name = getattr(all_args, "env_name", "cloud_scaling")
@@ -114,7 +120,7 @@ def main(args):
 
     runner = Runner(config)
     runner.run()
-
+    envs.close()
     # post process
     if all_args.use_eval and eval_envs is not envs:
         eval_envs.close()

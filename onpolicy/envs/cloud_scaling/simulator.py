@@ -93,3 +93,10 @@ class SimpleSimulator:
 
     def get_metrics(self, slot_idx):
         return self.metrics[int(slot_idx)]
+
+    def close(self):
+        """
+        Close simulator resources (no-op). Provided so callers can safely call
+        `sim.close()` if present without checking attribute existence.
+        """
+        return

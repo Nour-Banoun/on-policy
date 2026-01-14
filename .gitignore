@@ -16,3 +16,4 @@ logs
 *.so
 .venv
 *.log
+onpolicy/services/*
